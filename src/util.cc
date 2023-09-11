@@ -41,10 +41,6 @@
 #ifdef HAVE_NETINET_IN_H
 #  include <netinet/in.h>
 #endif // HAVE_NETINET_IN_H
-#ifdef HAVE_NETINET_IP_H
-#  include <netinet/ip.h>
-#endif // HAVE_NETINET_IP_H
-#include <netinet/udp.h>
 #ifdef _WIN32
 #  include <ws2tcpip.h>
 #else // !_WIN32
@@ -70,9 +66,41 @@
 #include "ssl_compat.h"
 #include "timegm.h"
 
+// std::optional<std::string> read_pem(const std::string_view &filename,
+//                                     const std::string_view &name,
+//                                     const std::string_view &type);
+
+// int write_pem(const std::string_view &filename, const std::string_view &name,
+//               const std::string_view &type, const uint8_t *data,
+//               size_t datalen);
+
+
+// std::optional<std::string> read_token(const std::string_view &filename) {
+//   return read_pem(filename, "token", "QUIC TOKEN");
+// }
+
+// int write_token(const std::string_view &filename, const uint8_t *token,
+//                 size_t tokenlen) {
+//   return write_pem(filename, "token", "QUIC TOKEN", token, tokenlen);
+// }
+
+// std::optional<std::string>
+// read_transport_params(const std::string_view &filename) {
+//   return read_pem(filename, "transport parameters",
+//                   "QUIC TRANSPORT PARAMETERS");
+// }
+
+// int write_transport_params(const std::string_view &filename,
+//                            const uint8_t *data, size_t datalen) {
+//   return write_pem(filename, "transport parameters",
+//                    "QUIC TRANSPORT PARAMETERS", data, datalen);
+// }
+
 namespace nghttp2 {
 
 namespace util {
+
+
 
 #ifndef _WIN32
 namespace {
@@ -1683,12 +1711,11 @@ int msghdr_get_local_addr(Address &dest, msghdr *msg, int family) {
   case AF_INET:
     for (auto cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
       if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
-        in_pktinfo pktinfo;
-        memcpy(&pktinfo, CMSG_DATA(cmsg), sizeof(pktinfo));
+        auto pktinfo = reinterpret_cast<in_pktinfo *>(CMSG_DATA(cmsg));
         dest.len = sizeof(dest.su.in);
         auto &sa = dest.su.in;
         sa.sin_family = AF_INET;
-        sa.sin_addr = pktinfo.ipi_addr;
+        sa.sin_addr = pktinfo->ipi_addr;
 
         return 0;
       }
@@ -1698,12 +1725,11 @@ int msghdr_get_local_addr(Address &dest, msghdr *msg, int family) {
   case AF_INET6:
     for (auto cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
       if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO) {
-        in6_pktinfo pktinfo;
-        memcpy(&pktinfo, CMSG_DATA(cmsg), sizeof(pktinfo));
+        auto pktinfo = reinterpret_cast<in6_pktinfo *>(CMSG_DATA(cmsg));
         dest.len = sizeof(dest.su.in6);
         auto &sa = dest.su.in6;
         sa.sin6_family = AF_INET6;
-        sa.sin6_addr = pktinfo.ipi6_addr;
+        sa.sin6_addr = pktinfo->ipi6_addr;
         return 0;
       }
     }
@@ -1714,18 +1740,13 @@ int msghdr_get_local_addr(Address &dest, msghdr *msg, int family) {
   return -1;
 }
 
-uint8_t msghdr_get_ecn(msghdr *msg, int family) {
+unsigned int msghdr_get_ecn(msghdr *msg, int family) {
   switch (family) {
   case AF_INET:
     for (auto cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
-      if (cmsg->cmsg_level == IPPROTO_IP &&
-#  ifdef __APPLE__
-          cmsg->cmsg_type == IP_RECVTOS
-#  else  // !__APPLE__
-          cmsg->cmsg_type == IP_TOS
-#  endif // !__APPLE__
-          && cmsg->cmsg_len) {
-        return *reinterpret_cast<uint8_t *>(CMSG_DATA(cmsg)) & IPTOS_ECN_MASK;
+      if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS &&
+          cmsg->cmsg_len) {
+        return *reinterpret_cast<uint8_t *>(CMSG_DATA(cmsg));
       }
     }
 
@@ -1734,11 +1755,7 @@ uint8_t msghdr_get_ecn(msghdr *msg, int family) {
     for (auto cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
       if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_TCLASS &&
           cmsg->cmsg_len) {
-        unsigned int tos;
-
-        memcpy(&tos, CMSG_DATA(cmsg), sizeof(tos));
-
-        return tos & IPTOS_ECN_MASK;
+        return *reinterpret_cast<uint8_t *>(CMSG_DATA(cmsg));
       }
     }
 
@@ -1748,20 +1765,25 @@ uint8_t msghdr_get_ecn(msghdr *msg, int family) {
   return 0;
 }
 
-size_t msghdr_get_udp_gro(msghdr *msg) {
-  uint16_t gso_size = 0;
-
-#  ifdef UDP_GRO
-  for (auto cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
-    if (cmsg->cmsg_level == SOL_UDP && cmsg->cmsg_type == UDP_GRO) {
-      memcpy(&gso_size, CMSG_DATA(cmsg), sizeof(gso_size));
-
-      break;
+int fd_set_send_ecn(int fd, int family, unsigned int ecn) {
+  switch (family) {
+  case AF_INET:
+    if (setsockopt(fd, IPPROTO_IP, IP_TOS, &ecn,
+                   static_cast<socklen_t>(sizeof(ecn))) == -1) {
+      return -1;
     }
-  }
-#  endif // UDP_GRO
 
-  return gso_size;
+    return 0;
+  case AF_INET6:
+    if (setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &ecn,
+                   static_cast<socklen_t>(sizeof(ecn))) == -1) {
+      return -1;
+    }
+
+    return 0;
+  }
+
+  return -1;
 }
 #endif // ENABLE_HTTP3
 

@@ -51,9 +51,9 @@
 #include <openssl/err.h>
 
 #ifdef ENABLE_HTTP3
-#  ifdef HAVE_LIBNGTCP2_CRYPTO_QUICTLS
-#    include <ngtcp2/ngtcp2_crypto_quictls.h>
-#  endif // HAVE_LIBNGTCP2_CRYPTO_QUICTLS
+#  ifdef HAVE_LIBNGTCP2_CRYPTO_OPENSSL
+#    include <ngtcp2/ngtcp2_crypto_openssl.h>
+#  endif // HAVE_LIBNGTCP2_CRYPTO_OPENSSL
 #  ifdef HAVE_LIBNGTCP2_CRYPTO_BORINGSSL
 #    include <ngtcp2/ngtcp2_crypto_boringssl.h>
 #  endif // HAVE_LIBNGTCP2_CRYPTO_BORINGSSL
@@ -79,6 +79,11 @@
 using namespace nghttp2;
 
 namespace h2load {
+
+bool is_session = true;
+const char *session_file = "sessionfile";
+const char *tp_file = "tpfile";
+int re_conn_client = 0;
 
 namespace {
 bool recorded(const std::chrono::steady_clock::time_point &t) {
@@ -202,6 +207,8 @@ void sampling_init(Sampling &smp, size_t max_samples) {
 }
 } // namespace
 
+bool re_conn = false;
+
 namespace {
 void writecb(struct ev_loop *loop, ev_io *w, int revents) {
   auto client = static_cast<Client *>(w->data);
@@ -234,6 +241,16 @@ void readcb(struct ev_loop *loop, ev_io *w, int revents) {
   client->restart_timeout();
   if (client->do_read() != 0) {
     if (client->try_again_or_fail() == 0) {
+      return;
+    }
+    client->worker->free_client(client);
+    delete client;
+    return;
+  }
+  if (re_conn) {
+    re_conn = false;
+    client->new_connection_requested = true;
+     if (client->try_again_or_fail() == 0) {
       return;
     }
     client->worker->free_client(client);
@@ -531,6 +548,19 @@ Client::~Client() {
 int Client::do_read() { return readfn(*this); }
 int Client::do_write() { return writefn(*this); }
 
+
+void print_session_info(SSL *ssl) {
+    // 获取当前 SSL 连接的会话数据
+    SSL_SESSION *session = SSL_get_session(ssl);
+
+    if (session == NULL) {
+        printf("会话为空\n");
+        return;
+    } else {
+        printf("会话不为空\n");
+    }
+}
+
 int Client::make_socket(addrinfo *addr) {
   int rv;
 
@@ -540,14 +570,6 @@ int Client::make_socket(addrinfo *addr) {
     if (fd == -1) {
       return -1;
     }
-
-#  ifdef UDP_GRO
-    int val = 1;
-    if (setsockopt(fd, IPPROTO_UDP, UDP_GRO, &val, sizeof(val)) != 0) {
-      std::cerr << "setsockopt UDP_GRO failed" << std::endl;
-      return -1;
-    }
-#  endif // UDP_GRO
 
     rv = util::bind_any_addr_udp(fd, addr->ai_family);
     if (rv != 0) {
@@ -580,6 +602,30 @@ int Client::make_socket(addrinfo *addr) {
       }
 
       SSL_set_connect_state(ssl);
+
+      //print_session_info(ssl);
+
+      if (is_session && session_file && (id < re_conn_client)) {
+        auto f = BIO_new_file(session_file, "r");
+        if (f == nullptr) {
+          ;//std::cerr << "Could not read TLS session file " << std::endl;
+        } else {
+          auto session = PEM_read_bio_SSL_SESSION(f, nullptr, 0, nullptr);
+          BIO_free(f);
+          if (session == nullptr) {
+            ;//std::cerr << "Could not read TLS session file " << std::endl;
+          } else {
+            if (!SSL_set_session(ssl, session)) {
+              ;//std::cerr << "Could not set session" << std::endl;
+            } 
+            
+            SSL_SESSION_free(session);
+          }
+        }
+      }
+
+      //print_session_info(ssl);
+
     }
   }
 
@@ -606,7 +652,6 @@ int Client::make_socket(addrinfo *addr) {
 
 int Client::connect() {
   int rv;
-
   if (!worker->config->is_timing_based_mode() ||
       worker->current_phase == Phase::MAIN_DURATION) {
     record_client_start_time();
@@ -716,6 +761,7 @@ void Client::fail() {
 }
 
 void Client::disconnect() {
+
   record_client_end_time();
 
 #ifdef ENABLE_HTTP3
@@ -749,6 +795,8 @@ void Client::disconnect() {
         SSL_free(ssl);
         ssl = nullptr;
       }
+      SSL_free(ssl);
+      ssl = nullptr;
     }
   }
   if (fd != -1) {
@@ -780,6 +828,7 @@ int Client::submit_request() {
   if (worker->config->conn_active_timeout > 0. && req_left == 0) {
     ev_timer_start(worker->loop, &conn_active_watcher);
   }
+
 
   return 0;
 }
@@ -992,6 +1041,7 @@ void Client::on_status_code(int32_t stream_id, uint16_t status) {
   } else {
     stream.status_success = 0;
   }
+
 }
 
 void Client::on_stream_close(int32_t stream_id, bool success, bool final) {
@@ -1060,6 +1110,11 @@ void Client::on_stream_close(int32_t stream_id, bool success, bool final) {
   if (req_left == 0 && req_inflight == 0) {
     terminate_session();
     return;
+  } 
+
+  if (config.is_quic()) {
+    re_conn = true;
+    return; 
   }
 
   if (!final && req_left > 0) {
@@ -1333,7 +1388,6 @@ int Client::connected() {
 
     readfn = &Client::tls_handshake;
     writefn = &Client::tls_handshake;
-
     return do_write();
   }
 
@@ -1469,8 +1523,7 @@ int Client::write_udp(const sockaddr *addr, socklen_t addrlen,
     cm->cmsg_level = SOL_UDP;
     cm->cmsg_type = UDP_SEGMENT;
     cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
-    uint16_t n = gso_size;
-    memcpy(CMSG_DATA(cm), &n, sizeof(n));
+    *(reinterpret_cast<uint16_t *>(CMSG_DATA(cm))) = gso_size;
   }
 #  endif // UDP_SEGMENT
 
@@ -2324,6 +2377,31 @@ Options:
 }
 } // namespace
 
+namespace {
+int new_session_cb(SSL *ssl, SSL_SESSION *session) {
+
+  if (config.is_quic()) {
+    if (SSL_SESSION_get_max_early_data(session) !=
+      std::numeric_limits<uint32_t>::max()) {
+      //std::cerr << "max_early_data_size is not 0xffffffff" << std::endl;
+    }
+  }
+  auto f = BIO_new_file(session_file, "w");
+  if (f == nullptr) {
+    std::cerr << "Could not write TLS session in " << std::endl;
+    return 0;
+  }
+
+  if (!PEM_write_bio_SSL_SESSION(f, session)) {
+    std::cerr << "Unable to write TLS session to file" << std::endl;
+  }
+
+  BIO_free(f);
+
+  return 0;
+}
+} // namespace
+
 int main(int argc, char **argv) {
   tls::libssl_init();
 
@@ -2338,6 +2416,7 @@ int main(int argc, char **argv) {
   while (1) {
     static int flag = 0;
     constexpr static option long_options[] = {
+        {"re_conn", required_argument, nullptr, 'L'},
         {"requests", required_argument, nullptr, 'n'},
         {"clients", required_argument, nullptr, 'c'},
         {"data", required_argument, nullptr, 'd'},
@@ -2377,12 +2456,21 @@ int main(int argc, char **argv) {
         {nullptr, 0, nullptr, 0}};
     int option_index = 0;
     auto c = getopt_long(argc, argv,
-                         "hvW:c:d:m:n:p:t:w:f:H:i:r:T:N:D:B:", long_options,
+                         "hvW:c:d:m:n:p:t:w:f:H:i:r:T:N:D:B:L:", long_options,
                          &option_index);
     if (c == -1) {
       break;
     }
     switch (c) {
+      
+    case 'L': {
+      re_conn_client = util::parse_uint(optarg);
+      if (re_conn_client == -1) {
+        std::cerr << "-L: bad option value: " << optarg << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      break;
+    }
     case 'n': {
       auto n = util::parse_uint(optarg);
       if (n == -1) {
@@ -2912,6 +3000,17 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
+//////////////////////////////////////////////////////////////////////////////
+/////////////////////// bpq //////////////////////////////////////////////////
+
+  
+  if (is_session) {
+    SSL_CTX_set_session_cache_mode(ssl_ctx, SSL_SESS_CACHE_CLIENT |
+                                                 SSL_SESS_CACHE_NO_INTERNAL);
+    SSL_CTX_sess_set_new_cb(ssl_ctx, new_session_cb);
+    
+  }
+
   auto ssl_opts = (SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS) |
                   SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION |
                   SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION;
@@ -2928,13 +3027,13 @@ int main(int argc, char **argv) {
 
   if (config.is_quic()) {
 #ifdef ENABLE_HTTP3
-#  ifdef HAVE_LIBNGTCP2_CRYPTO_QUICTLS
-    if (ngtcp2_crypto_quictls_configure_client_context(ssl_ctx) != 0) {
-      std::cerr << "ngtcp2_crypto_quictls_configure_client_context failed"
+#  ifdef HAVE_LIBNGTCP2_CRYPTO_OPENSSL
+    if (ngtcp2_crypto_openssl_configure_client_context(ssl_ctx) != 0) {
+      std::cerr << "ngtcp2_crypto_openssl_configure_client_context failed"
                 << std::endl;
       exit(EXIT_FAILURE);
     }
-#  endif // HAVE_LIBNGTCP2_CRYPTO_QUICTLS
+#  endif // HAVE_LIBNGTCP2_CRYPTO_OPENSSL
 #  ifdef HAVE_LIBNGTCP2_CRYPTO_BORINGSSL
     if (ngtcp2_crypto_boringssl_configure_client_context(ssl_ctx) != 0) {
       std::cerr << "ngtcp2_crypto_boringssl_configure_client_context failed"

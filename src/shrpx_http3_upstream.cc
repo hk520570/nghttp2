@@ -551,7 +551,7 @@ int Http3Upstream::init(const UpstreamAddr *faddr, const Address &remote_addr,
                         const Address &local_addr,
                         const ngtcp2_pkt_hd &initial_hd,
                         const ngtcp2_cid *odcid, const uint8_t *token,
-                        size_t tokenlen, ngtcp2_token_type token_type) {
+                        size_t tokenlen) {
   int rv;
 
   auto worker = handler_->get_worker();
@@ -638,9 +638,6 @@ int Http3Upstream::init(const UpstreamAddr *faddr, const Address &remote_addr,
   settings.rand_ctx.native_handle = &worker->get_randgen();
   settings.token = token;
   settings.tokenlen = tokenlen;
-  settings.token_type = token_type;
-  settings.initial_pkt_num = std::uniform_int_distribution<uint32_t>(
-      0, std::numeric_limits<int32_t>::max())(worker->get_randgen());
 
   ngtcp2_transport_params params;
   ngtcp2_transport_params_default(&params);
@@ -1501,7 +1498,7 @@ void Http3Upstream::on_handler_delete() {
   auto worker = handler_->get_worker();
   auto quic_conn_handler = worker->get_quic_connection_handler();
 
-  std::vector<ngtcp2_cid> scids(ngtcp2_conn_get_scid(conn_, nullptr) + 1);
+  std::vector<ngtcp2_cid> scids(ngtcp2_conn_get_num_scid(conn_) + 1);
   ngtcp2_conn_get_scid(conn_, scids.data());
   scids.back() = hashed_scid_;
 
@@ -1560,7 +1557,9 @@ void Http3Upstream::on_handler_delete() {
   auto cw = std::make_unique<CloseWait>(worker, std::move(scids),
                                         std::move(conn_close_), d);
 
-  quic_conn_handler->add_close_wait(cw.release());
+  quic_conn_handler->add_close_wait(cw.get());
+
+  cw.release();
 }
 
 int Http3Upstream::on_downstream_reset(Downstream *downstream, bool no_retry) {

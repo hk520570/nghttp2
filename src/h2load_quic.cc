@@ -28,9 +28,9 @@
 
 #include <iostream>
 
-#ifdef HAVE_LIBNGTCP2_CRYPTO_QUICTLS
-#  include <ngtcp2/ngtcp2_crypto_quictls.h>
-#endif // HAVE_LIBNGTCP2_CRYPTO_QUICTLS
+#ifdef HAVE_LIBNGTCP2_CRYPTO_OPENSSL
+#  include <ngtcp2/ngtcp2_crypto_openssl.h>
+#endif // HAVE_LIBNGTCP2_CRYPTO_OPENSSL
 #ifdef HAVE_LIBNGTCP2_CRYPTO_BORINGSSL
 #  include <ngtcp2/ngtcp2_crypto_boringssl.h>
 #endif // HAVE_LIBNGTCP2_CRYPTO_BORINGSSL
@@ -42,19 +42,32 @@
 
 namespace h2load {
 
-namespace {
-int handshake_completed(ngtcp2_conn *conn, void *user_data) {
-  auto c = static_cast<Client *>(user_data);
+std::string_view token_file;
+extern bool is_session;
+extern char *session_file;
+extern char *tp_file;
+extern int re_conn_client;
 
-  if (c->quic_handshake_completed() != 0) {
-    return NGTCP2_ERR_CALLBACK_FAILURE;
+namespace {
+int recv_new_token(ngtcp2_conn *conn, const uint8_t *token, size_t tokenlen,
+                   void *user_data) {
+  if (token_file.empty()) {
+    return 0;
   }
+
+  auto f = BIO_new_file(token_file.data(), "w");
+  if (f == nullptr) {
+    std::cerr << "Could not write token in " << token_file << std::endl;
+    return 0;
+  }
+
+  PEM_write_bio(f, "QUIC TOKEN", "", token, tokenlen);
+  BIO_free(f);
 
   return 0;
 }
 } // namespace
 
-int Client::quic_handshake_completed() { return connection_made(); }
 
 namespace {
 int recv_stream_data(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
@@ -322,9 +335,113 @@ ngtcp2_conn *get_conn(ngtcp2_crypto_conn_ref *conn_ref) {
 }
 } // namespace
 
+
+namespace {
+void openssl_free_wrap(void *ptr) { OPENSSL_free(ptr); }
+} // namespace
+
+std::optional<std::string> read_pem(const std::string_view &filename,
+                                    const std::string_view &name,
+                                    const std::string_view &type) {
+  auto f = BIO_new_file(filename.data(), "r");
+  if (f == nullptr) {
+    ;//std::cerr << "Could not open " << name << " file " << filename << std::endl;
+    return {};
+  }
+
+  auto f_d = defer(BIO_free, f);
+
+  char *pem_type, *header;
+  unsigned char *data;
+  long datalen;
+
+  if (PEM_read_bio(f, &pem_type, &header, &data, &datalen) != 1) {
+    ;//std::cerr << "Could not read " << name << " file " << filename << std::endl;
+    return {};
+  }
+
+  auto pem_type_d = defer(openssl_free_wrap, pem_type);
+  auto pem_header = defer(openssl_free_wrap, header);
+  auto data_d = defer(openssl_free_wrap, data);
+
+  if (type != pem_type) {
+    ;//std::cerr << name << " file " << filename << " contains unexpected type" << std::endl;
+    return {};
+  }
+
+  return std::string{data, data + datalen};
+}
+
+int write_pem(const std::string_view &filename, const std::string_view &name,
+              const std::string_view &type, const uint8_t *data,
+              size_t datalen) {
+  auto f = BIO_new_file(filename.data(), "w");
+  if (f == nullptr) {
+    std::cerr << "Could not write " << name << " in " << filename << std::endl;
+    return -1;
+  }
+
+  PEM_write_bio(f, type.data(), "", data, datalen);
+  BIO_free(f);
+
+  return 0;
+}
+
+
+std::optional<std::string>
+read_transport_params(const std::string_view &filename) {
+  return read_pem(filename, "transport parameters",
+                  "QUIC TRANSPORT PARAMETERS");
+}
+
+int write_transport_params(const std::string_view &filename,
+                           const uint8_t *data, size_t datalen) {
+  return write_pem(filename, "transport parameters",
+                   "QUIC TRANSPORT PARAMETERS", data, datalen);
+}
+
+std::optional<std::string> read_token(const std::string_view &filename) {
+  return read_pem(filename, "token", "QUIC TOKEN");
+}
+
+namespace {
+int handshake_completed(ngtcp2_conn *conn, void *user_data) {
+  auto c = static_cast<Client *>(user_data);
+
+  if (c->quic_handshake_completed() != 0) {
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
+
+  return 0;
+}
+} // namespace
+
+int Client::quic_handshake_completed() { 
+  if (tp_file) {
+    std::array<uint8_t, 256> data;
+    auto datalen = ngtcp2_conn_encode_0rtt_transport_params(quic.conn, data.data(),
+                                                            data.size());
+    if (datalen < 0) {
+      std::cerr << "Could not encode 0-RTT transport parameters: "
+                << ngtcp2_strerror(datalen) << std::endl;
+    } else if (write_transport_params(tp_file, data.data(),
+                                            datalen) != 0) {
+      std::cerr << "Could not write transport parameters in " << tp_file
+                << std::endl;
+    }
+  }
+
+
+  return connection_made(); 
+}
+
+
+
 int Client::quic_init(const sockaddr *local_addr, socklen_t local_addrlen,
                       const sockaddr *remote_addr, socklen_t remote_addrlen) {
   int rv;
+
+  bool early_data_ = false;
 
   if (!ssl) {
     ssl = SSL_new(worker->ssl_ctx);
@@ -335,6 +452,32 @@ int Client::quic_init(const sockaddr *local_addr, socklen_t local_addrlen,
     SSL_set_app_data(ssl, &quic.conn_ref);
     SSL_set_connect_state(ssl);
     SSL_set_quic_use_legacy_codepoint(ssl, 0);
+
+    //print_session_info(ssl);
+
+
+    if (is_session && session_file && (id < re_conn_client)) {
+      auto f = BIO_new_file(session_file, "r");
+      if (f == nullptr) {
+        ;//std::cerr << "Could not read TLS session file " << session_file << std::endl;
+      } else {
+        auto session = PEM_read_bio_SSL_SESSION(f, nullptr, 0, nullptr);
+        BIO_free(f);
+        if (session == nullptr) {
+          ;//std::cerr << "Could not read TLS session file " << session_file << std::endl;
+        } else {
+          if (!SSL_set_session(ssl, session)) {
+            ;//std::cerr << "Could not set session" << std::endl;
+          } else if (SSL_SESSION_get_max_early_data(session)) {
+            early_data_ = true;
+            SSL_set_quic_early_data_enabled(ssl, 1);
+          }
+          SSL_SESSION_free(session);
+        }
+      }
+    }
+
+    //print_session_info(ssl);
   }
 
   auto callbacks = ngtcp2_callbacks{
@@ -366,7 +509,7 @@ int Client::quic_init(const sockaddr *local_addr, socklen_t local_addrlen,
       h2load::extend_max_stream_data,
       nullptr, // dcid_status
       nullptr, // handshake_confirmed
-      nullptr, // recv_new_token
+      recv_new_token, // recv_new_token
       ngtcp2_crypto_delete_crypto_aead_ctx_cb,
       ngtcp2_crypto_delete_crypto_cipher_ctx_cb,
       nullptr, // recv_datagram
@@ -405,6 +548,7 @@ int Client::quic_init(const sockaddr *local_addr, socklen_t local_addrlen,
     path += util::utos(id);
     path += ".sqlog";
     quic.qlog_file = fopen(path.c_str(), "w");
+    printf("%s\n", path.c_str());
     if (quic.qlog_file == nullptr) {
       std::cerr << "Failed to open a qlog file: " << path << std::endl;
       return -1;
@@ -415,6 +559,22 @@ int Client::quic_init(const sockaddr *local_addr, socklen_t local_addrlen,
     settings.max_tx_udp_payload_size = config->max_udp_payload_size;
     settings.no_tx_udp_payload_size_shaping = 1;
   }
+
+  ////////////////////////////////////////////////////
+  ////////////// bpq ////////////////////////////////
+  std::string token;
+
+  if (!token_file.empty()) {
+    // std::cerr << "Reading token file " << token_file << std::endl;
+
+    auto t = read_token(token_file);
+    if (t) {
+      token = std::move(*t);
+      settings.token = reinterpret_cast<const uint8_t *>(token.data());
+      settings.tokenlen = token.size();
+    }
+  }
+
 
   ngtcp2_transport_params params;
   ngtcp2_transport_params_default(&params);
@@ -455,6 +615,22 @@ int Client::quic_init(const sockaddr *local_addr, socklen_t local_addrlen,
   }
 
   ngtcp2_conn_set_tls_native_handle(quic.conn, ssl);
+
+  if (early_data_ && tp_file) {
+    auto params = read_transport_params(tp_file);
+    if (!params) {
+      early_data_ = false;
+    } else {
+      auto rv = ngtcp2_conn_decode_and_set_0rtt_transport_params(
+          quic.conn, reinterpret_cast<const uint8_t *>(params->data()),
+          params->size());
+      if (rv != 0) {
+        std::cerr << "ngtcp2_conn_decode_and_set_0rtt_transport_params:"
+                  << ngtcp2_strerror(rv) << std::endl;
+        early_data_ = false;
+      } 
+    }
+  }
 
   return 0;
 }
@@ -538,38 +714,20 @@ void Client::quic_restart_pkt_timer() {
 }
 
 int Client::read_quic() {
-  std::array<uint8_t, 65535> buf;
+  std::array<uint8_t, 65536> buf;
   sockaddr_union su;
+  socklen_t addrlen = sizeof(su);
   int rv;
   size_t pktcnt = 0;
   ngtcp2_pkt_info pi{};
 
-  iovec msg_iov;
-  msg_iov.iov_base = buf.data();
-  msg_iov.iov_len = buf.size();
-
-  msghdr msg{};
-  msg.msg_name = &su;
-  msg.msg_iov = &msg_iov;
-  msg.msg_iovlen = 1;
-
-  uint8_t msg_ctrl[CMSG_SPACE(sizeof(uint16_t))];
-  msg.msg_control = msg_ctrl;
-
   auto ts = quic_timestamp();
 
   for (;;) {
-    msg.msg_namelen = sizeof(su);
-    msg.msg_controllen = sizeof(msg_ctrl);
-
-    auto nread = recvmsg(fd, &msg, 0);
+    auto nread =
+        recvfrom(fd, buf.data(), buf.size(), MSG_DONTWAIT, &su.sa, &addrlen);
     if (nread == -1) {
       return 0;
-    }
-
-    auto gso_size = util::msghdr_get_udp_gro(&msg);
-    if (gso_size == 0) {
-      gso_size = static_cast<size_t>(nread);
     }
 
     assert(quic.conn);
@@ -583,41 +741,28 @@ int Client::read_quic() {
         },
         {
             &su.sa,
-            msg.msg_namelen,
+            addrlen,
         },
     };
 
-    auto data = buf.data();
+    rv = ngtcp2_conn_read_pkt(quic.conn, &path, &pi, buf.data(), nread, ts);
+    if (rv != 0) {
+      std::cerr << "ngtcp2_conn_read_pkt: " << ngtcp2_strerror(rv) << std::endl;
 
-    for (;;) {
-      auto datalen = std::min(static_cast<size_t>(nread), gso_size);
-
-      ++pktcnt;
-
-      rv = ngtcp2_conn_read_pkt(quic.conn, &path, &pi, data, datalen, ts);
-      if (rv != 0) {
-        if (!quic.last_error.error_code) {
-          if (rv == NGTCP2_ERR_CRYPTO) {
-            ngtcp2_ccerr_set_tls_alert(&quic.last_error,
-                                       ngtcp2_conn_get_tls_alert(quic.conn),
-                                       nullptr, 0);
-          } else {
-            ngtcp2_ccerr_set_liberr(&quic.last_error, rv, nullptr, 0);
-          }
+      if (!quic.last_error.error_code) {
+        if (rv == NGTCP2_ERR_CRYPTO) {
+          ngtcp2_ccerr_set_tls_alert(&quic.last_error,
+                                     ngtcp2_conn_get_tls_alert(quic.conn),
+                                     nullptr, 0);
+        } else {
+          ngtcp2_ccerr_set_liberr(&quic.last_error, rv, nullptr, 0);
         }
-
-        return -1;
       }
 
-      nread -= datalen;
-      if (nread == 0) {
-        break;
-      }
-
-      data += datalen;
+      return -1;
     }
 
-    if (pktcnt >= 100) {
+    if (++pktcnt == 100) {
       break;
     }
   }
@@ -626,6 +771,10 @@ int Client::read_quic() {
 }
 
 int Client::write_quic() {
+  if (!quic.conn) {
+    return ERR_CONNECT_FAIL;
+  }
+
   int rv;
 
   ev_io_stop(worker->loop, &wev);

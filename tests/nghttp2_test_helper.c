@@ -54,7 +54,8 @@ int unpack_frame(nghttp2_frame *frame, const uint8_t *in, size_t len) {
   switch (frame->hd.type) {
   case NGHTTP2_HEADERS:
     payloadoff = ((frame->hd.flags & NGHTTP2_FLAG_PADDED) > 0);
-    nghttp2_frame_unpack_headers_payload(&frame->headers, payload + payloadoff);
+    rv = nghttp2_frame_unpack_headers_payload(&frame->headers,
+                                              payload + payloadoff);
     break;
   case NGHTTP2_PRIORITY:
     nghttp2_frame_unpack_priority_payload(&frame->priority, payload);
@@ -67,7 +68,8 @@ int unpack_frame(nghttp2_frame *frame, const uint8_t *in, size_t len) {
         &frame->settings.iv, &frame->settings.niv, payload, payloadlen, mem);
     break;
   case NGHTTP2_PUSH_PROMISE:
-    nghttp2_frame_unpack_push_promise_payload(&frame->push_promise, payload);
+    rv = nghttp2_frame_unpack_push_promise_payload(&frame->push_promise,
+                                                   payload);
     break;
   case NGHTTP2_PING:
     nghttp2_frame_unpack_ping_payload(&frame->ping, payload);

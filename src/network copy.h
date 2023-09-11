@@ -1,7 +1,8 @@
 /*
- * nghttp2 - HTTP/2 C Library
+ * ngtcp2
  *
- * Copyright (c) 2016 Tatsuhiro Tsujikawa
+ * Copyright (c) 2017 ngtcp2 contributors
+ * Copyright (c) 2016 nghttp2 contributors
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -33,11 +34,7 @@
 #ifdef HAVE_SYS_SOCKET_H
 #  include <sys/socket.h>
 #endif // HAVE_SYS_SOCKET_H
-#ifdef _WIN32
-#  include <ws2tcpip.h>
-#else // !_WIN32
-#  include <sys/un.h>
-#endif // !_WIN32
+#include <sys/un.h>
 #ifdef HAVE_NETINET_IN_H
 #  include <netinet/in.h>
 #endif // HAVE_NETINET_IN_H
@@ -45,22 +42,11 @@
 #  include <arpa/inet.h>
 #endif // HAVE_ARPA_INET_H
 
-namespace nghttp2 {
+#include <array>
 
-union sockaddr_union {
-  sockaddr_storage storage;
-  sockaddr sa;
-  sockaddr_in6 in6;
-  sockaddr_in in;
-#ifndef _WIN32
-  sockaddr_un un;
-#endif // !_WIN32
-};
+#include <ngtcp2/ngtcp2.h>
 
-struct Address {
-  size_t len;
-  union sockaddr_union su;
-};
+namespace ngtcp2 {
 
 enum network_error {
   NETWORK_ERR_OK = 0,
@@ -76,6 +62,19 @@ union in_addr_union {
   in6_addr in6;
 };
 
-} // namespace nghttp2
+union sockaddr_union {
+  sockaddr_storage storage;
+  sockaddr sa;
+  sockaddr_in6 in6;
+  sockaddr_in in;
+};
+
+struct Address {
+  socklen_t len;
+  union sockaddr_union su;
+  uint32_t ifindex;
+};
+
+} // namespace ngtcp2
 
 #endif // NETWORK_H
